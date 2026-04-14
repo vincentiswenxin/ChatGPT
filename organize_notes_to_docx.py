@@ -160,6 +160,33 @@ def load_notes_from_file(path: Path) -> List[str]:
     return []
 
 
+
+
+def resolve_docs_dir(preferred: Path) -> Path:
+    """Use DOCs by default, but gracefully fall back to docs/ when present."""
+    alt = preferred.parent / "docs" if preferred.name == "DOCs" else None
+
+    if preferred.exists() and preferred.is_dir():
+        preferred_has_supported = any(
+            p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+            for p in preferred.iterdir()
+        )
+        if preferred_has_supported:
+            return preferred
+        if alt and alt.exists() and alt.is_dir():
+            alt_has_supported = any(
+                p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+                for p in alt.iterdir()
+            )
+            if alt_has_supported:
+                return alt
+        return preferred
+
+    if alt and alt.exists() and alt.is_dir():
+        return alt
+
+    return preferred
+
 def discover_input_files(docs_dir: Path) -> List[Path]:
     if not docs_dir.exists() or not docs_dir.is_dir():
         raise SystemExit(f"DOCs directory not found: {docs_dir}")
@@ -341,7 +368,8 @@ def main() -> None:
     runs_dir = args.output_root / "runs" / f"run_{run_ts}"
     runs_dir.mkdir(parents=True, exist_ok=True)
 
-    files = discover_input_files(args.docs_dir)
+    docs_dir = resolve_docs_dir(args.docs_dir)
+    files = discover_input_files(docs_dir)
     raw_notes: List[str] = []
     for f in files:
         raw_notes.extend(load_notes_from_file(f))
@@ -356,6 +384,7 @@ def main() -> None:
     master_index, run_manifest = write_indexes(knowledge_dir, runs_dir, merged_rows, run_ts)
 
     print(f"Run timestamp: {run_ts}")
+    print(f"Input folder used: {docs_dir}")
     print(f"Source files: {len(files)}")
     for f in files:
         print(f" - {f}")

@@ -2,7 +2,7 @@
 
 This repo now follows your required operating model:
 
-1. Put raw notes in `DOCs/`.
+1. Put raw notes in `DOCs/` (or `docs/`; script auto-falls back if needed).
 2. Run processing in Codex.
 3. Classify each note into topic/subtopic.
 4. Grow a **knowledge base that never deletes prior outputs**.
@@ -74,7 +74,7 @@ If a new theme appears that is not covered by current rules, it currently falls 
 
 On each run:
 
-1. Script reads all input files from `DOCs/` (`.txt`, `.md`, `.docx`).
+1. Script reads all input files from `DOCs/` (`.txt`, `.md`, `.docx`) and falls back to `docs/` if `DOCs/` is missing.
 2. Cleans and deduplicates line notes.
 3. Loads the latest master index snapshot from `OUTPUT/knowledge_base/index_snapshots/`.
 4. Merges new notes into the knowledge base without duplicating existing note entries.
