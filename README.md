@@ -1,99 +1,93 @@
-# Notes Organizer (Immutable Knowledge-Base Workflow)
+# Model-First Notes Organizer
 
-This repo now follows your required operating model:
+This repository follows a **model-first document processing workflow**.
 
-1. Put raw notes in `DOCs/` (or `docs/`; script auto-falls back if needed).
-2. Run processing in Codex.
-3. Classify each note into topic/subtopic.
-4. Grow a **knowledge base that never deletes prior outputs**.
+The purpose of this repo is to use GitHub as a storage and versioned output workspace, while using the model itself as the primary engine for reading, organizing, restructuring, and writing documentation.
 
-## Core guarantees
+## Operating model
 
-- **No deletion of previous outputs**: every run creates timestamped snapshot files.
-- **No overwrite requirement for history**: prior snapshots stay on disk.
-- **Knowledge base growth over time**: new runs merge with latest index snapshot and add newly discovered notes.
+1. Place source materials anywhere in the repository where they are easy to access.
+2. Ask Codex to read the relevant files directly from the repo.
+3. Have Codex use the model itself to reorganize, synthesize, and polish the material.
+4. Write all final outputs back into `OUTPUT/` so they remain accessible in GitHub.
 
----
+## Core principles
 
-## Run
+- **GitHub is the storage layer**
+  - Inputs live in the repo
+  - Outputs live in the repo
+  - Final deliverables should be committed back into GitHub
 
-```bash
-python organize_notes_to_docx.py
-```
+- **The model is the processing layer**
+  - The main work should be done through model-based understanding and editorial transformation
+  - Avoid relying on rule-based scripts, keyword taxonomies, or parser pipelines as the primary method
 
-Optional:
+- **Markdown is the default output format**
+  - Final deliverables should be written as `.md` files
+  - Avoid `.docx` generation unless explicitly requested later
 
-```bash
-python organize_notes_to_docx.py --docs-dir DOCs --output-root OUTPUT
-```
+## Output goals
 
----
+The desired outputs are not shallow summaries.
 
-## Output layout
+The goal is to produce:
+- comprehensive training notes
+- structured training manuals
+- working reference documents
+- publication-friendly internal documentation
 
-Every run creates two major areas:
+Outputs should:
+- preserve meaningful detail
+- retain nuance and useful context
+- merge overlapping material intelligently
+- remove only true redundancy
+- improve readability, structure, and navigation
+- be suitable for actual use, not just high-level review
 
-### 1) Persistent knowledge base snapshots
-- `OUTPUT/knowledge_base/topics/...`
-  - Topic snapshots: `Topic__YYYYMMDD_HHMMSS.docx`
-  - Subtopic snapshots: `Subtopic__YYYYMMDD_HHMMSS.docx`
-- `OUTPUT/knowledge_base/index_snapshots/master_index__YYYYMMDD_HHMMSS.csv`
+## Default output location
 
-### 2) Per-run manifest
-- `OUTPUT/runs/run_YYYYMMDD_HHMMSS/run_manifest.csv`
+Write final deliverables into:
 
-This means older output files are preserved and never removed by the script.
+`OUTPUT/model_outputs/`
 
----
+Typical deliverables may include:
 
-## Topic and subtopic taxonomy
+- `master_training_manual.md`
+- `table_of_contents.md`
+- `topic_01_<name>.md`
+- `topic_02_<name>.md`
+- `topic_03_<name>.md`
 
-Current deterministic taxonomy:
+Additional topic files may be created as needed.
 
-- **Training Notes**
-  - Leadership_Training
-  - Compliance_Training
-  - Product_Training
-  - Process_Training
-- **Client & Wealth**
-  - Client_Reviews
-  - Portfolio_Planning
-  - Market_View
-- **Finance & Operations**
-  - Budgeting
-  - Operations
-  - Risk_Controls
-- **General**
-  - General_Notes
+## Navigation standard
 
-If a new theme appears that is not covered by current rules, it currently falls back to `General / General_Notes`.
+Outputs should be easy to browse and reuse.
 
----
+Prefer:
+- clear headings and subheadings
+- consistent section naming
+- table of contents
+- cross-references where useful
+- publication-friendly document structure
 
-## How growth works
+## Important note
 
-On each run:
+This repository should not default to a coding-first workflow.
 
-1. Script reads all input files from `DOCs/` (`.txt`, `.md`, `.docx`) and falls back to `docs/` if `DOCs/` is missing.
-2. Cleans and deduplicates line notes.
-3. Loads the latest master index snapshot from `OUTPUT/knowledge_base/index_snapshots/`.
-4. Merges new notes into the knowledge base without duplicating existing note entries.
-5. Writes new timestamped topic/subtopic `.docx` snapshots and new CSV snapshots.
+Unless explicitly requested, Codex should **not** treat the task as:
+- building a rule-based classifier
+- generating a processing script
+- creating a keyword taxonomy engine
+- constructing a parser-based summarization pipeline
 
----
+The primary deliverable is the written documentation itself.
 
-## Important limitations (transparent)
+## Practical workflow
 
-- The CLI itself is deterministic/rule-based and does not directly invoke live model APIs.
-- In Codex sessions, we can still iteratively improve taxonomy and structure based on your feedback.
-- For true semantic rewriting with the model on every run, that must happen through an interactive Codex run (or a separate API-integrated mode).
+When new materials are added to the repository:
 
----
-
-## Practical usage for your workflow
-
-When you upload more raw files into `DOCs/`:
-
-1. Ask Codex to process them.
-2. Codex runs the script and can also review/restructure taxonomy as needed.
-3. New snapshot files are produced and old files remain preserved.
+1. Ask Codex to process the relevant files directly from GitHub.
+2. Codex should use the model to interpret and reorganize the content.
+3. Codex should write the final Markdown outputs into `OUTPUT/model_outputs/`.
+4. Those outputs should remain in the repository for direct access through GitHub.
