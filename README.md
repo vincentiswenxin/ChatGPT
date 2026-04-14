@@ -1,11 +1,12 @@
-# Professional Note Organizer (DOCs ➜ OUTPUT)
+# Notes Organizer (DOCs → OUTPUT)
 
-This tool is built for your workflow:
+Simple repository for one job: take raw notes from `DOCs/` and generate Word files grouped by topic in `OUTPUT/`.
 
-- You place raw materials in `DOCs/`.
-- Script organizes notes into professional sections.
-- Script creates a downloadable run folder in `OUTPUT/`.
-- Every output artifact is a **Word document (`.docx`)**, grouped by section folder.
+## Repo structure
+
+- `organize_notes_to_docx.py` — main script.
+- `DOCs/` — your raw input files (`.txt`, `.md`, `.docx`).
+- `OUTPUT/` — generated exports (timestamped folder + `latest/`).
 
 ## Run
 
@@ -13,25 +14,24 @@ This tool is built for your workflow:
 python organize_notes_to_docx.py
 ```
 
-Defaults:
-- input folder: `DOCs/`
-- output root: `OUTPUT/`
-
 Optional:
 
 ```bash
 python organize_notes_to_docx.py --docs-dir DOCs --output-root OUTPUT
 ```
 
-## Output structure
+## What gets generated
 
-For each run, the script creates:
+Each run creates:
 
 - `OUTPUT/notes_export_YYYYMMDD_HHMMSS/`
-  - one folder per section (e.g., `People_Management/`)
-  - one Word file per section (e.g., `People_Management/People_Management.docx`)
+  - one subfolder per section
+  - one `.docx` file per section
+  - `categorization_audit.csv` (section mapping + duplicate merge count)
+- `OUTPUT/latest/`
+  - mirror of the newest run for easy download
 
-## Sections (professional taxonomy)
+## Categories
 
 - People Management
 - Compliance & Risk
@@ -41,17 +41,11 @@ For each run, the script creates:
 - Finance & Planning
 - Operations & Admin
 - Learning & Research
-- General
+- General (fallback)
 
-## Logic quality rules
+## Notes
 
-- Notes are deduplicated using normalized matching.
-- Cleanup is intentionally light so original meaning remains intact.
-- Dates (if present) are extracted and used for ordering.
-- Similar topics are grouped into the same section document.
-
-## Supported raw formats in DOCs
-
-- `.txt`
-- `.md`
-- `.docx`
+- Deduplicates similar lines.
+- Applies light cleanup (preserves original meaning).
+- Extracts simple dates and sorts dated items first.
+- Keeps all outputs in `.docx` format.

@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Organize notes from DOCs/ into section-based Word documents.
+"""Convert raw notes in DOCs/ into sectioned .docx files in OUTPUT/.
 
-Default workflow:
-- Read raw materials from DOCs/
-- Clean + deduplicate notes
-- Categorize into professional sections (management, compliance, finance, etc.)
-- Create a downloadable output folder with one Word document per section
+Workflow:
+1) Read .txt/.md/.docx files from DOCs/
+2) Normalize + lightly clean + deduplicate notes
+3) Categorize notes into professional sections
+4) Write one .docx per section into a timestamped export folder
+5) Refresh OUTPUT/latest/ with the newest export
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -47,7 +50,7 @@ SHORTHAND_MAP: tuple[Tuple[str, str], ...] = (
 
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".docx"}
 DATE_PATTERNS = (
-    r"\b(\d{4}-\d{2}-\d{2})\b",  # 2026-04-14
+    r"\b(\d{4}-\d{2}-\d{2})\b",      # 2026-04-14
     r"\b(\d{1,2}/\d{1,2}/\d{4})\b",  # 04/14/2026
     r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",  # April 14, 2026
 )
@@ -86,10 +89,8 @@ def clean_note_text(note: str) -> str:
 
 
 def dedupe_key(note: str) -> str:
-    lowered = note.lower()
-    lowered = re.sub(r"[^a-z0-9\s]", "", lowered)
-    lowered = re.sub(r"\s+", " ", lowered).strip()
-    return lowered
+    lowered = re.sub(r"[^a-z0-9\s]", "", note.lower())
+    return re.sub(r"\s+", " ", lowered).strip()
 
 
 def parse_date(note: str) -> Optional[datetime]:
@@ -107,12 +108,7 @@ def parse_date(note: str) -> Optional[datetime]:
 
 
 def split_lines_to_notes(text: str) -> List[str]:
-    notes: List[str] = []
-    for raw in text.splitlines():
-        note = normalize_note(raw)
-        if note:
-            notes.append(note)
-    return notes
+    return [n for n in (normalize_note(line) for line in text.splitlines()) if n]
 
 
 def load_notes_from_docx(path: Path) -> List[str]:
@@ -132,51 +128,54 @@ def load_notes_from_file(path: Path) -> List[str]:
     return []
 
 
-def discover_docs_files(docs_dir: Path) -> List[Path]:
+def discover_input_files(docs_dir: Path) -> List[Path]:
     if not docs_dir.exists() or not docs_dir.is_dir():
         raise SystemExit(f"DOCs directory not found: {docs_dir}")
     files = sorted(p for p in docs_dir.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS)
     if not files:
-        raise SystemExit(f"No supported raw note files in {docs_dir}. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        raise SystemExit(f"No supported files found in {docs_dir}. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
     return files
 
 
-def deduplicate_and_clean(notes: List[str]) -> Tuple[List[str], Dict[str, int]]:
-    seen: Dict[str, str] = {}
+def deduplicate_and_clean(notes: Iterable[str]) -> Tuple[List[str], Dict[str, int]]:
+    seen_by_key: Dict[str, str] = {}
     counts: Dict[str, int] = {}
     for note in notes:
         cleaned = clean_note_text(note)
         key = dedupe_key(cleaned)
         if not key:
             continue
-        if key in seen:
-            canonical = seen[key]
+        if key in seen_by_key:
+            canonical = seen_by_key[key]
             counts[canonical] = counts.get(canonical, 1) + 1
         else:
-            seen[key] = cleaned
+            seen_by_key[key] = cleaned
             counts[cleaned] = 1
-    return list(seen.values()), counts
+    return list(seen_by_key.values()), counts
 
 
 def categorize_note(note: str) -> str:
     lowered = note.lower()
     scores = {rule.name: 0 for rule in CATEGORY_RULES}
     for rule in CATEGORY_RULES:
-        for kw in rule.keywords:
-            if kw in lowered:
+        for keyword in rule.keywords:
+            if keyword in lowered:
                 scores[rule.name] += 1
     best = max(scores, key=scores.get)
     return best if scores[best] > 0 else "General"
 
 
-def categorize_and_sort(notes: List[str]) -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = {}
-    for n in notes:
-        out.setdefault(categorize_note(n), []).append(n)
+def categorize_and_sort(notes: Iterable[str]) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[str]] = {}
+    for note in notes:
+        grouped.setdefault(categorize_note(note), []).append(note)
 
-    for section, items in out.items():
-        out[section] = sorted(items, key=lambda x: (parse_date(x) is None, parse_date(x) or datetime.min, x.lower()))
-    return out
+    for section, section_notes in grouped.items():
+        grouped[section] = sorted(
+            section_notes,
+            key=lambda n: (parse_date(n) is None, parse_date(n) or datetime.min, n.lower()),
+        )
+    return grouped
 
 
 def paragraph_xml(text: str, bold: bool = False) -> str:
@@ -192,13 +191,17 @@ def build_doc_xml(title: str, notes: List[str], dup_counts: Dict[str, int]) -> s
         paragraph_xml("", False),
     ]
     for i, note in enumerate(notes, start=1):
-        d = parse_date(note)
-        date_prefix = f"[{d.strftime('%Y-%m-%d')}] " if d else ""
+        parsed = parse_date(note)
+        date_prefix = f"[{parsed.strftime('%Y-%m-%d')}] " if parsed else ""
         merged = dup_counts.get(note, 1)
         suffix = f" (merged duplicates: {merged - 1})" if merged > 1 else ""
         lines.append(paragraph_xml(f"{i}. {date_prefix}{note}{suffix}"))
     body = "".join(lines)
-    return f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr/></w:body></w:document>'
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        f"<w:body>{body}<w:sectPr/></w:body></w:document>"
+    )
 
 
 def write_docx(path: Path, xml: str) -> None:
@@ -208,11 +211,11 @@ def write_docx(path: Path, xml: str) -> None:
         zf.writestr("word/document.xml", xml)
 
 
-def write_outputs(base_out: Path, sections: Dict[str, List[str]], dup_counts: Dict[str, int]) -> List[Path]:
+def write_outputs(output_dir: Path, sections: Dict[str, List[str]], dup_counts: Dict[str, int]) -> List[Path]:
     generated: List[Path] = []
     for section, notes in sorted(sections.items()):
         folder_name = re.sub(r"[^A-Za-z0-9_-]+", "_", section).strip("_") or "General"
-        section_dir = base_out / folder_name
+        section_dir = output_dir / folder_name
         section_dir.mkdir(parents=True, exist_ok=True)
         docx_path = section_dir / f"{folder_name}.docx"
         write_docx(docx_path, build_doc_xml(section, notes, dup_counts))
@@ -220,33 +223,53 @@ def write_outputs(base_out: Path, sections: Dict[str, List[str]], dup_counts: Di
     return generated
 
 
+def write_audit_csv(path: Path, sections: Dict[str, List[str]], dup_counts: Dict[str, int]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["section", "note", "duplicates_merged"])
+        for section, notes in sorted(sections.items()):
+            for note in notes:
+                writer.writerow([section, note, max(0, dup_counts.get(note, 1) - 1)])
+
+
+def refresh_latest(output_root: Path, run_dir: Path) -> Path:
+    latest_dir = output_root / "latest"
+    if latest_dir.exists():
+        shutil.rmtree(latest_dir)
+    shutil.copytree(run_dir, latest_dir)
+    return latest_dir
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Organize raw notes from DOCs/ into professional section-based Word files.")
-    parser.add_argument("--docs-dir", type=Path, default=Path("DOCs"), help="Raw materials folder (default: DOCs)")
-    parser.add_argument("--output-root", type=Path, default=Path("OUTPUT"), help="Root output folder for downloadable results")
+    parser = argparse.ArgumentParser(description="Organize notes from DOCs/ into sectioned .docx outputs.")
+    parser.add_argument("--docs-dir", type=Path, default=Path("DOCs"), help="Raw note folder (default: DOCs)")
+    parser.add_argument("--output-root", type=Path, default=Path("OUTPUT"), help="Output root folder (default: OUTPUT)")
     args = parser.parse_args()
 
-    source_files = discover_docs_files(args.docs_dir)
+    source_files = discover_input_files(args.docs_dir)
     raw_notes: List[str] = []
-    for f in source_files:
-        raw_notes.extend(load_notes_from_file(f))
+    for source in source_files:
+        raw_notes.extend(load_notes_from_file(source))
     if not raw_notes:
-        raise SystemExit("No note lines found in DOCs inputs.")
+        raise SystemExit("No note lines found in input files.")
 
     unique_notes, dup_counts = deduplicate_and_clean(raw_notes)
     sections = categorize_and_sort(unique_notes)
 
-    run_folder = args.output_root / f"notes_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-    run_folder.mkdir(parents=True, exist_ok=True)
-    generated = write_outputs(run_folder, sections, dup_counts)
+    run_dir = args.output_root / f"notes_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    generated = write_outputs(run_dir, sections, dup_counts)
+    write_audit_csv(run_dir / "categorization_audit.csv", sections, dup_counts)
+    latest_dir = refresh_latest(args.output_root, run_dir)
 
     print(f"Source files: {len(source_files)}")
-    for f in source_files:
-        print(f" - {f}")
-    print(f"Output folder: {run_folder}")
+    for source in source_files:
+        print(f" - {source}")
+    print(f"Output folder: {run_dir.resolve()}")
+    print(f"Latest folder: {latest_dir.resolve()}")
     print(f"Generated section documents: {len(generated)}")
-    for g in generated:
-        print(f" - {g}")
+    for output in generated:
+        print(f" - {output}")
 
 
 if __name__ == "__main__":
