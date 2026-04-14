@@ -1,49 +1,70 @@
 #!/usr/bin/env python3
-"""Convert raw notes in DOCs/ into sectioned .docx files in OUTPUT/.
+"""Organize notes from DOCs/ into section + subtopic DOCX exports.
 
-Workflow:
-1) Read .txt/.md/.docx files from DOCs/
-2) Normalize + lightly clean + deduplicate notes
-3) Categorize notes (rule-based or OpenAI-assisted)
-4) Write one .docx per section into a timestamped export folder
-5) Refresh OUTPUT/latest/ with the newest export
+This script is API-key free and deterministic:
+- Reads notes from DOCs/
+- Cleans and deduplicates notes
+- Classifies into topic + subtopic via taxonomy rules
+- Maintains cumulative knowledge by merging with OUTPUT/latest/search_index.csv
+- Writes section/subtopic Word files and searchable indexes
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
-import os
 import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib import error, request
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
 @dataclass(frozen=True)
-class CategoryRule:
+class SubtopicRule:
     name: str
     keywords: tuple[str, ...]
 
 
-CATEGORY_RULES: tuple[CategoryRule, ...] = (
-    CategoryRule("People Management", ("manager", "leadership", "1:1", "one on one", "hiring", "coach", "feedback", "promotion", "performance", "team")),
-    CategoryRule("Compliance & Risk", ("compliance", "regulation", "regulatory", "sec", "finra", "kyc", "aml", "risk", "policy", "audit", "control", "breach")),
-    CategoryRule("Wealth Management", ("portfolio", "allocation", "asset mix", "advisor", "client objective", "retirement", "estate", "trust", "wealth", "tax efficiency")),
-    CategoryRule("Investments & Markets", ("equity", "fixed income", "bond", "market", "valuation", "earnings", "macro", "rate", "duration", "volatility", "hedge")),
-    CategoryRule("Client Service", ("client", "meeting", "follow up", "proposal", "onboarding", "review", "relationship", "service")),
-    CategoryRule("Finance & Planning", ("budget", "expense", "invoice", "p&l", "forecast", "revenue", "margin", "cash flow", "opex", "capex")),
-    CategoryRule("Operations & Admin", ("process", "workflow", "document", "renew", "subscription", "appointment", "schedule", "checklist", "todo")),
-    CategoryRule("Learning & Research", ("learn", "study", "course", "research", "read", "book", "training", "certification")),
+@dataclass(frozen=True)
+class TopicRule:
+    name: str
+    subtopics: tuple[SubtopicRule, ...]
+
+
+TAXONOMY: tuple[TopicRule, ...] = (
+    TopicRule(
+        "Training Notes",
+        (
+            SubtopicRule("Leadership_Training", ("leadership", "manager", "coaching", "feedback", "1:1", "one on one")),
+            SubtopicRule("Compliance_Training", ("compliance", "sec", "finra", "kyc", "aml", "regulatory")),
+            SubtopicRule("Product_Training", ("product", "feature", "platform", "demo", "onboarding")),
+            SubtopicRule("Process_Training", ("workflow", "process", "checklist", "sop", "procedure")),
+        ),
+    ),
+    TopicRule(
+        "Client & Wealth",
+        (
+            SubtopicRule("Client_Reviews", ("client", "meeting", "review", "follow up", "relationship")),
+            SubtopicRule("Portfolio_Planning", ("portfolio", "allocation", "retirement", "estate", "wealth", "trust")),
+            SubtopicRule("Market_View", ("equity", "bond", "market", "macro", "valuation", "rate", "volatility")),
+        ),
+    ),
+    TopicRule(
+        "Finance & Operations",
+        (
+            SubtopicRule("Budgeting", ("budget", "forecast", "expense", "cash flow", "margin", "revenue")),
+            SubtopicRule("Operations", ("operations", "admin", "document", "schedule", "task", "todo")),
+            SubtopicRule("Risk_Controls", ("risk", "audit", "control", "policy", "breach")),
+        ),
+    ),
 )
 
-ALLOWED_CATEGORIES = {rule.name for rule in CATEGORY_RULES} | {"General"}
+FALLBACK_TOPIC = "General"
+FALLBACK_SUBTOPIC = "General_Notes"
 
 SHORTHAND_MAP: tuple[Tuple[str, str], ...] = (
     (r"\bmtg\b", "meeting"),
@@ -55,9 +76,9 @@ SHORTHAND_MAP: tuple[Tuple[str, str], ...] = (
 
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".docx"}
 DATE_PATTERNS = (
-    r"\b(\d{4}-\d{2}-\d{2})\b",      # 2026-04-14
-    r"\b(\d{1,2}/\d{1,2}/\d{4})\b",  # 04/14/2026
-    r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",  # April 14, 2026
+    r"\b(\d{4}-\d{2}-\d{2})\b",
+    r"\b(\d{1,2}/\d{1,2}/\d{4})\b",
+    r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",
 )
 
 DOCX_CONTENT_TYPES = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
@@ -159,109 +180,57 @@ def deduplicate_and_clean(notes: Iterable[str]) -> Tuple[List[str], Dict[str, in
     return list(seen_by_key.values()), counts
 
 
-def categorize_note_rule_based(note: str) -> str:
+def classify_note(note: str) -> Tuple[str, str]:
     lowered = note.lower()
-    scores = {rule.name: 0 for rule in CATEGORY_RULES}
-    for rule in CATEGORY_RULES:
-        for keyword in rule.keywords:
-            if keyword in lowered:
-                scores[rule.name] += 1
-    best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "General"
+    best_topic = FALLBACK_TOPIC
+    best_subtopic = FALLBACK_SUBTOPIC
+    best_score = 0
+
+    for topic in TAXONOMY:
+        for subtopic in topic.subtopics:
+            score = sum(1 for kw in subtopic.keywords if kw in lowered)
+            if score > best_score:
+                best_score = score
+                best_topic = topic.name
+                best_subtopic = subtopic.name
+
+    return best_topic, best_subtopic
 
 
 def sort_notes(notes: Iterable[str]) -> List[str]:
     return sorted(notes, key=lambda n: (parse_date(n) is None, parse_date(n) or datetime.min, n.lower()))
 
 
-def extract_json_array(text: str) -> List[dict]:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text).strip()
-        text = re.sub(r"```$", "", text).strip()
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("No JSON array found in model response")
-    return json.loads(text[start : end + 1])
+def load_prior_notes(output_root: Path) -> List[dict]:
+    index_file = output_root / "latest" / "search_index.csv"
+    if not index_file.exists():
+        return []
+
+    rows: List[dict] = []
+    with index_file.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            note = row.get("final_note", "").strip()
+            topic = row.get("topic", FALLBACK_TOPIC).strip() or FALLBACK_TOPIC
+            subtopic = row.get("subtopic", FALLBACK_SUBTOPIC).strip() or FALLBACK_SUBTOPIC
+            if note:
+                rows.append({"topic": topic, "subtopic": subtopic, "note": note, "source": "historical"})
+    return rows
 
 
-def call_openai_chat(model: str, prompt: str, api_key: str, timeout_seconds: int = 90) -> str:
-    payload = {
-        "model": model,
-        "temperature": 0.2,
-        "messages": [
-            {"role": "system", "content": "You are a precise financial/compliance note editor and classifier."},
-            {"role": "user", "content": prompt},
-        ],
-    }
-    req = request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with request.urlopen(req, timeout=timeout_seconds) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"OpenAI API error: HTTP {exc.code} {detail}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(f"OpenAI API connection error: {exc}") from exc
+def merge_new_with_prior(new_notes: List[str], prior_rows: List[dict]) -> List[dict]:
+    merged: Dict[str, dict] = {}
 
-    try:
-        return body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Unexpected OpenAI response format: {body}") from exc
+    for row in prior_rows:
+        key = dedupe_key(row["note"])
+        merged[key] = row
 
+    for note in new_notes:
+        topic, subtopic = classify_note(note)
+        key = dedupe_key(note)
+        merged[key] = {"topic": topic, "subtopic": subtopic, "note": note, "source": "current_run"}
 
-def ai_rewrite_and_categorize(notes: List[str], model: str, api_key: str) -> List[dict]:
-    categories = ", ".join(sorted(ALLOWED_CATEGORIES))
-    notes_json = json.dumps(notes, ensure_ascii=False)
-    prompt = (
-        "For each note, create a professional rewrite and choose one category.\n"
-        "Rules:\n"
-        "- Keep factual meaning, do not invent details.\n"
-        "- Improve clarity, grammar, and professionalism.\n"
-        "- Keep each rewrite concise and complete.\n"
-        f"- category must be exactly one of: {categories}.\n"
-        "Return only JSON array with objects of shape: "
-        "{\"original\": string, \"rewritten\": string, \"category\": string}.\n"
-        f"Input notes: {notes_json}"
-    )
-    raw = call_openai_chat(model=model, prompt=prompt, api_key=api_key)
-    items = extract_json_array(raw)
-
-    by_original: Dict[str, dict] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        original = str(item.get("original", "")).strip()
-        rewritten = str(item.get("rewritten", "")).strip()
-        category = str(item.get("category", "")).strip()
-        if not original:
-            continue
-        if category not in ALLOWED_CATEGORIES:
-            category = "General"
-        if not rewritten:
-            rewritten = original
-        by_original[original] = {"original": original, "rewritten": rewritten, "category": category}
-
-    output: List[dict] = []
-    for note in notes:
-        output.append(by_original.get(note, {"original": note, "rewritten": note, "category": categorize_note_rule_based(note)}))
-    return output
-
-
-def build_sections_from_items(items: List[dict]) -> Dict[str, List[str]]:
-    grouped: Dict[str, List[str]] = {}
-    for item in items:
-        grouped.setdefault(item["category"], []).append(item["rewritten"])
-    return {section: sort_notes(values) for section, values in grouped.items()}
+    return list(merged.values())
 
 
 def paragraph_xml(text: str, bold: bool = False) -> str:
@@ -269,9 +238,10 @@ def paragraph_xml(text: str, bold: bool = False) -> str:
     return f"<w:p><w:r>{props}<w:t xml:space=\"preserve\">{escape(text)}</w:t></w:r></w:p>"
 
 
-def build_doc_xml(title: str, notes: List[str], dup_counts: Dict[str, int]) -> str:
+def build_doc_xml(title: str, subtitle: str, notes: List[str]) -> str:
     lines = [
         paragraph_xml(title, bold=True),
+        paragraph_xml(subtitle, False),
         paragraph_xml(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", False),
         paragraph_xml(f"Items: {len(notes)}", False),
         paragraph_xml("", False),
@@ -279,9 +249,8 @@ def build_doc_xml(title: str, notes: List[str], dup_counts: Dict[str, int]) -> s
     for i, note in enumerate(notes, start=1):
         parsed = parse_date(note)
         date_prefix = f"[{parsed.strftime('%Y-%m-%d')}] " if parsed else ""
-        merged = dup_counts.get(note, 1)
-        suffix = f" (merged duplicates: {merged - 1})" if merged > 1 else ""
-        lines.append(paragraph_xml(f"{i}. {date_prefix}{note}{suffix}"))
+        lines.append(paragraph_xml(f"{i}. {date_prefix}{note}"))
+
     body = "".join(lines)
     return (
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
@@ -297,30 +266,64 @@ def write_docx(path: Path, xml: str) -> None:
         zf.writestr("word/document.xml", xml)
 
 
-def write_outputs(output_dir: Path, sections: Dict[str, List[str]], dup_counts: Dict[str, int]) -> List[Path]:
+def write_outputs(run_dir: Path, rows: List[dict]) -> List[Path]:
+    by_topic_subtopic: Dict[Tuple[str, str], List[str]] = {}
+    by_topic: Dict[str, List[str]] = {}
+
+    for row in rows:
+        topic = row["topic"]
+        subtopic = row["subtopic"]
+        note = row["note"]
+        by_topic_subtopic.setdefault((topic, subtopic), []).append(note)
+        by_topic.setdefault(topic, []).append(note)
+
     generated: List[Path] = []
-    for section, notes in sorted(sections.items()):
-        folder_name = re.sub(r"[^A-Za-z0-9_-]+", "_", section).strip("_") or "General"
-        section_dir = output_dir / folder_name
-        section_dir.mkdir(parents=True, exist_ok=True)
-        docx_path = section_dir / f"{folder_name}.docx"
-        write_docx(docx_path, build_doc_xml(section, notes, dup_counts))
-        generated.append(docx_path)
+
+    for topic, notes in sorted(by_topic.items()):
+        topic_dir = run_dir / sanitize_name(topic)
+        topic_dir.mkdir(parents=True, exist_ok=True)
+        topic_doc = topic_dir / f"{sanitize_name(topic)}.docx"
+        write_docx(topic_doc, build_doc_xml(topic, "Master topic document", sort_notes(notes)))
+        generated.append(topic_doc)
+
+    for (topic, subtopic), notes in sorted(by_topic_subtopic.items()):
+        subtopic_dir = run_dir / sanitize_name(topic) / sanitize_name(subtopic)
+        subtopic_dir.mkdir(parents=True, exist_ok=True)
+        subtopic_doc = subtopic_dir / f"{sanitize_name(subtopic)}.docx"
+        write_docx(subtopic_doc, build_doc_xml(topic, f"Subtopic: {subtopic}", sort_notes(notes)))
+        generated.append(subtopic_doc)
+
     return generated
 
 
-def write_audit_csv(path: Path, items: List[dict], dup_counts: Dict[str, int], ai_enabled: bool) -> None:
-    with path.open("w", encoding="utf-8", newline="") as f:
+def sanitize_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_") or "General"
+
+
+def write_indexes(run_dir: Path, rows: List[dict], duplicate_counts: Dict[str, int]) -> None:
+    audit_file = run_dir / "categorization_audit.csv"
+    with audit_file.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["category", "original_note", "final_note", "duplicates_merged", "ai_enhanced"])
-        for item in items:
-            final_note = item["rewritten"]
+        writer.writerow(["topic", "subtopic", "final_note", "duplicates_merged", "source"])
+        for row in sorted(rows, key=lambda r: (r["topic"], r["subtopic"], r["note"].lower())):
             writer.writerow([
-                item["category"],
-                item["original"],
-                final_note,
-                max(0, dup_counts.get(item["original"], 1) - 1),
-                "yes" if ai_enabled else "no",
+                row["topic"],
+                row["subtopic"],
+                row["note"],
+                max(0, duplicate_counts.get(row["note"], 1) - 1),
+                row["source"],
+            ])
+
+    search_file = run_dir / "search_index.csv"
+    with search_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["topic", "subtopic", "final_note", "path_hint"])
+        for row in sorted(rows, key=lambda r: (r["topic"], r["subtopic"], r["note"].lower())):
+            writer.writerow([
+                row["topic"],
+                row["subtopic"],
+                row["note"],
+                f"{sanitize_name(row['topic'])}/{sanitize_name(row['subtopic'])}/{sanitize_name(row['subtopic'])}.docx",
             ])
 
 
@@ -333,11 +336,9 @@ def refresh_latest(output_root: Path, run_dir: Path) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Organize notes from DOCs/ into sectioned .docx outputs.")
+    parser = argparse.ArgumentParser(description="Organize notes from DOCs/ into topic/subtopic .docx outputs.")
     parser.add_argument("--docs-dir", type=Path, default=Path("DOCs"), help="Raw note folder (default: DOCs)")
     parser.add_argument("--output-root", type=Path, default=Path("OUTPUT"), help="Output root folder (default: OUTPUT)")
-    parser.add_argument("--use-openai", action="store_true", help="Use OpenAI model to rewrite and categorize notes.")
-    parser.add_argument("--openai-model", default="gpt-4.1-mini", help="Model name when --use-openai is enabled.")
     args = parser.parse_args()
 
     source_files = discover_input_files(args.docs_dir)
@@ -347,36 +348,24 @@ def main() -> None:
     if not raw_notes:
         raise SystemExit("No note lines found in input files.")
 
-    unique_notes, dup_counts = deduplicate_and_clean(raw_notes)
-
-    ai_enabled = False
-    if args.use_openai:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise SystemExit("--use-openai was set, but OPENAI_API_KEY is missing.")
-        items = ai_rewrite_and_categorize(unique_notes, args.openai_model, api_key)
-        ai_enabled = True
-    else:
-        items = [
-            {"original": note, "rewritten": note, "category": categorize_note_rule_based(note)}
-            for note in unique_notes
-        ]
-
-    sections = build_sections_from_items(items)
+    unique_notes, duplicate_counts = deduplicate_and_clean(raw_notes)
+    prior_rows = load_prior_notes(args.output_root)
+    merged_rows = merge_new_with_prior(unique_notes, prior_rows)
 
     run_dir = args.output_root / f"notes_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    generated = write_outputs(run_dir, sections, dup_counts)
-    write_audit_csv(run_dir / "categorization_audit.csv", items, dup_counts, ai_enabled)
+
+    generated = write_outputs(run_dir, merged_rows)
+    write_indexes(run_dir, merged_rows, duplicate_counts)
     latest_dir = refresh_latest(args.output_root, run_dir)
 
     print(f"Source files: {len(source_files)}")
     for source in source_files:
         print(f" - {source}")
-    print(f"AI mode: {'enabled' if ai_enabled else 'disabled'}")
+    print(f"Merged notes in knowledge base: {len(merged_rows)}")
     print(f"Output folder: {run_dir.resolve()}")
     print(f"Latest folder: {latest_dir.resolve()}")
-    print(f"Generated section documents: {len(generated)}")
+    print(f"Generated documents: {len(generated)}")
     for output in generated:
         print(f" - {output}")
 
