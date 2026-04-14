@@ -1,28 +1,21 @@
-# Notes Organizer (Codex-first Workflow)
+# Notes Organizer (Immutable Knowledge-Base Workflow)
 
-This repository is built for your exact process:
+This repo now follows your required operating model:
 
-1. You drop raw notes into `DOCs/`.
-2. We run processing inside this Codex environment.
-3. Notes are cleaned, deduplicated, categorized, and exported into Word files.
-4. New notes are merged into the existing knowledge base so organization improves over time.
+1. Put raw notes in `DOCs/`.
+2. Run processing in Codex.
+3. Classify each note into topic/subtopic.
+4. Grow a **knowledge base that never deletes prior outputs**.
 
-No API key is required for this workflow.
+## Core guarantees
 
----
-
-## Repository Structure
-
-- `organize_notes_to_docx.py`  
-  Main script for note ingestion, cleanup, categorization, and Word export.
-- `DOCs/`  
-  Input folder for your raw source notes (`.txt`, `.md`, `.docx`).
-- `OUTPUT/`  
-  Generated exports. The latest run is always mirrored to `OUTPUT/latest/`.
+- **No deletion of previous outputs**: every run creates timestamped snapshot files.
+- **No overwrite requirement for history**: prior snapshots stay on disk.
+- **Knowledge base growth over time**: new runs merge with latest index snapshot and add newly discovered notes.
 
 ---
 
-## How to Run
+## Run
 
 ```bash
 python organize_notes_to_docx.py
@@ -36,21 +29,26 @@ python organize_notes_to_docx.py --docs-dir DOCs --output-root OUTPUT
 
 ---
 
-## What the Script Does
+## Output layout
 
-### 1) Ingests notes from `DOCs/`
-Supported formats:
-- `.txt`
-- `.md`
-- `.docx`
+Every run creates two major areas:
 
-### 2) Cleans and deduplicates
-- Normalizes list prefixes and spacing.
-- Expands common shorthand (`mtg` → `meeting`, etc.).
-- Deduplicates semantically similar lines using normalized keys.
+### 1) Persistent knowledge base snapshots
+- `OUTPUT/knowledge_base/topics/...`
+  - Topic snapshots: `Topic__YYYYMMDD_HHMMSS.docx`
+  - Subtopic snapshots: `Subtopic__YYYYMMDD_HHMMSS.docx`
+- `OUTPUT/knowledge_base/index_snapshots/master_index__YYYYMMDD_HHMMSS.csv`
 
-### 3) Classifies into Topic → Subtopic
-Deterministic taxonomy (keyword-based), currently including:
+### 2) Per-run manifest
+- `OUTPUT/runs/run_YYYYMMDD_HHMMSS/run_manifest.csv`
+
+This means older output files are preserved and never removed by the script.
+
+---
+
+## Topic and subtopic taxonomy
+
+Current deterministic taxonomy:
 
 - **Training Notes**
   - Leadership_Training
@@ -68,54 +66,34 @@ Deterministic taxonomy (keyword-based), currently including:
 - **General**
   - General_Notes
 
-### 4) Merges with prior knowledge
-If `OUTPUT/latest/search_index.csv` exists, previously organized notes are loaded and merged with new notes.
-
-### 5) Exports Word documents and indexes
-Each run creates:
-
-- `OUTPUT/notes_export_YYYYMMDD_HHMMSS/`
-  - Topic master docs (`Topic/Topic.docx`)
-  - Subtopic docs (`Topic/Subtopic/Subtopic.docx`)
-  - `categorization_audit.csv`
-  - `search_index.csv`
-- `OUTPUT/latest/`
-  - Fresh mirror of the newest run for easy download.
+If a new theme appears that is not covered by current rules, it currently falls back to `General / General_Notes`.
 
 ---
 
-## Output Files Explained
+## How growth works
 
-### `categorization_audit.csv`
-Audit trail containing:
-- topic
-- subtopic
-- final_note
-- duplicates_merged
-- source (`historical` or `current_run`)
+On each run:
 
-### `search_index.csv`
-Search helper containing:
-- topic
-- subtopic
-- final_note
-- path_hint (where note lives in output docs)
+1. Script reads all input files from `DOCs/` (`.txt`, `.md`, `.docx`).
+2. Cleans and deduplicates line notes.
+3. Loads the latest master index snapshot from `OUTPUT/knowledge_base/index_snapshots/`.
+4. Merges new notes into the knowledge base without duplicating existing note entries.
+5. Writes new timestamped topic/subtopic `.docx` snapshots and new CSV snapshots.
 
 ---
 
-## Ongoing Usage Pattern
+## Important limitations (transparent)
 
-When you provide more notes in future:
-1. Add files to `DOCs/`
-2. Run the script
-3. Download from `OUTPUT/latest/`
-
-This keeps your training notes and related topics continuously organized and searchable.
-
----
-
-## Notes About Codex + Model Usage
-
-- This repository script is deterministic and does not call external APIs.
+- The CLI itself is deterministic/rule-based and does not directly invoke live model APIs.
 - In Codex sessions, we can still iteratively improve taxonomy and structure based on your feedback.
-- If you want deeper semantic rewriting in the future, we can add an optional model-assisted mode again, but the current default is API-key-free.
+- For true semantic rewriting with the model on every run, that must happen through an interactive Codex run (or a separate API-integrated mode).
+
+---
+
+## Practical usage for your workflow
+
+When you upload more raw files into `DOCs/`:
+
+1. Ask Codex to process them.
+2. Codex runs the script and can also review/restructure taxonomy as needed.
+3. New snapshot files are produced and old files remain preserved.

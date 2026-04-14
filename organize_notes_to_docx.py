@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Organize notes from DOCs/ into section + subtopic DOCX exports.
+"""Grow an immutable note knowledge base from DOCs/ into OUTPUT/.
 
-This script is API-key free and deterministic:
-- Reads notes from DOCs/
-- Cleans and deduplicates notes
-- Classifies into topic + subtopic via taxonomy rules
-- Maintains cumulative knowledge by merging with OUTPUT/latest/search_index.csv
-- Writes section/subtopic Word files and searchable indexes
+Design goals:
+- Never delete previous outputs
+- Keep a growing knowledge base with deduped notes
+- Classify notes into topic/subtopic deterministically
+- Emit timestamped DOCX snapshots per topic/subtopic
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ from __future__ import annotations
 import argparse
 import csv
 import re
-import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -85,7 +83,7 @@ DOCX_CONTENT_TYPES = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"ye
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">
   <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>
   <Default Extension=\"xml\" ContentType=\"application/xml\"/>
-  <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>
+  <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
 </Types>
 """
 
@@ -94,6 +92,14 @@ DOCX_RELS = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
   <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>
 </Relationships>
 """
+
+
+def timestamp() -> str:
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def sanitize_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_") or "General"
 
 
 def normalize_note(line: str) -> str:
@@ -163,21 +169,14 @@ def discover_input_files(docs_dir: Path) -> List[Path]:
     return files
 
 
-def deduplicate_and_clean(notes: Iterable[str]) -> Tuple[List[str], Dict[str, int]]:
+def deduplicate_and_clean(notes: Iterable[str]) -> List[str]:
     seen_by_key: Dict[str, str] = {}
-    counts: Dict[str, int] = {}
     for note in notes:
         cleaned = clean_note_text(note)
         key = dedupe_key(cleaned)
-        if not key:
-            continue
-        if key in seen_by_key:
-            canonical = seen_by_key[key]
-            counts[canonical] = counts.get(canonical, 1) + 1
-        else:
+        if key and key not in seen_by_key:
             seen_by_key[key] = cleaned
-            counts[cleaned] = 1
-    return list(seen_by_key.values()), counts
+    return list(seen_by_key.values())
 
 
 def classify_note(note: str) -> Tuple[str, str]:
@@ -201,13 +200,20 @@ def sort_notes(notes: Iterable[str]) -> List[str]:
     return sorted(notes, key=lambda n: (parse_date(n) is None, parse_date(n) or datetime.min, n.lower()))
 
 
-def load_prior_notes(output_root: Path) -> List[dict]:
-    index_file = output_root / "latest" / "search_index.csv"
-    if not index_file.exists():
+def latest_snapshot(index_dir: Path) -> Optional[Path]:
+    if not index_dir.exists():
+        return None
+    candidates = sorted(index_dir.glob("master_index__*.csv"))
+    return candidates[-1] if candidates else None
+
+
+def load_existing_knowledge(index_dir: Path) -> List[dict]:
+    snap = latest_snapshot(index_dir)
+    if not snap:
         return []
 
     rows: List[dict] = []
-    with index_file.open("r", encoding="utf-8", newline="") as f:
+    with snap.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             note = row.get("final_note", "").strip()
@@ -218,17 +224,20 @@ def load_prior_notes(output_root: Path) -> List[dict]:
     return rows
 
 
-def merge_new_with_prior(new_notes: List[str], prior_rows: List[dict]) -> List[dict]:
+def merge_knowledge(existing_rows: List[dict], new_notes: List[str]) -> List[dict]:
     merged: Dict[str, dict] = {}
 
-    for row in prior_rows:
-        key = dedupe_key(row["note"])
-        merged[key] = row
+    for row in existing_rows:
+        merged[dedupe_key(row["note"])] = row
 
     for note in new_notes:
         topic, subtopic = classify_note(note)
-        key = dedupe_key(note)
-        merged[key] = {"topic": topic, "subtopic": subtopic, "note": note, "source": "current_run"}
+        merged[dedupe_key(note)] = {
+            "topic": topic,
+            "subtopic": subtopic,
+            "note": note,
+            "source": "current_run",
+        }
 
     return list(merged.values())
 
@@ -241,10 +250,10 @@ def paragraph_xml(text: str, bold: bool = False) -> str:
 def build_doc_xml(title: str, subtitle: str, notes: List[str]) -> str:
     lines = [
         paragraph_xml(title, bold=True),
-        paragraph_xml(subtitle, False),
-        paragraph_xml(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", False),
-        paragraph_xml(f"Items: {len(notes)}", False),
-        paragraph_xml("", False),
+        paragraph_xml(subtitle),
+        paragraph_xml(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"),
+        paragraph_xml(f"Items: {len(notes)}"),
+        paragraph_xml(""),
     ]
     for i, note in enumerate(notes, start=1):
         parsed = parse_date(note)
@@ -266,56 +275,48 @@ def write_docx(path: Path, xml: str) -> None:
         zf.writestr("word/document.xml", xml)
 
 
-def write_outputs(run_dir: Path, rows: List[dict]) -> List[Path]:
-    by_topic_subtopic: Dict[Tuple[str, str], List[str]] = {}
-    by_topic: Dict[str, List[str]] = {}
+def write_snapshot_docs(knowledge_dir: Path, rows: List[dict], run_ts: str) -> List[Path]:
+    docs_root = knowledge_dir / "topics"
+    docs_root.mkdir(parents=True, exist_ok=True)
 
+    by_topic: Dict[str, List[str]] = {}
+    by_topic_subtopic: Dict[Tuple[str, str], List[str]] = {}
     for row in rows:
-        topic = row["topic"]
-        subtopic = row["subtopic"]
-        note = row["note"]
-        by_topic_subtopic.setdefault((topic, subtopic), []).append(note)
-        by_topic.setdefault(topic, []).append(note)
+        by_topic.setdefault(row["topic"], []).append(row["note"])
+        by_topic_subtopic.setdefault((row["topic"], row["subtopic"]), []).append(row["note"])
 
     generated: List[Path] = []
 
     for topic, notes in sorted(by_topic.items()):
-        topic_dir = run_dir / sanitize_name(topic)
+        topic_dir = docs_root / sanitize_name(topic)
         topic_dir.mkdir(parents=True, exist_ok=True)
-        topic_doc = topic_dir / f"{sanitize_name(topic)}.docx"
-        write_docx(topic_doc, build_doc_xml(topic, "Master topic document", sort_notes(notes)))
-        generated.append(topic_doc)
+        path = topic_dir / f"{sanitize_name(topic)}__{run_ts}.docx"
+        write_docx(path, build_doc_xml(topic, "Topic snapshot", sort_notes(notes)))
+        generated.append(path)
 
     for (topic, subtopic), notes in sorted(by_topic_subtopic.items()):
-        subtopic_dir = run_dir / sanitize_name(topic) / sanitize_name(subtopic)
-        subtopic_dir.mkdir(parents=True, exist_ok=True)
-        subtopic_doc = subtopic_dir / f"{sanitize_name(subtopic)}.docx"
-        write_docx(subtopic_doc, build_doc_xml(topic, f"Subtopic: {subtopic}", sort_notes(notes)))
-        generated.append(subtopic_doc)
+        sub_dir = docs_root / sanitize_name(topic) / sanitize_name(subtopic)
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        path = sub_dir / f"{sanitize_name(subtopic)}__{run_ts}.docx"
+        write_docx(path, build_doc_xml(topic, f"Subtopic snapshot: {subtopic}", sort_notes(notes)))
+        generated.append(path)
 
     return generated
 
 
-def sanitize_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_") or "General"
+def write_indexes(knowledge_dir: Path, runs_dir: Path, rows: List[dict], run_ts: str) -> Tuple[Path, Path]:
+    index_dir = knowledge_dir / "index_snapshots"
+    index_dir.mkdir(parents=True, exist_ok=True)
 
-
-def write_indexes(run_dir: Path, rows: List[dict], duplicate_counts: Dict[str, int]) -> None:
-    audit_file = run_dir / "categorization_audit.csv"
-    with audit_file.open("w", encoding="utf-8", newline="") as f:
+    master_index = index_dir / f"master_index__{run_ts}.csv"
+    with master_index.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["topic", "subtopic", "final_note", "duplicates_merged", "source"])
+        writer.writerow(["topic", "subtopic", "final_note", "source"])
         for row in sorted(rows, key=lambda r: (r["topic"], r["subtopic"], r["note"].lower())):
-            writer.writerow([
-                row["topic"],
-                row["subtopic"],
-                row["note"],
-                max(0, duplicate_counts.get(row["note"], 1) - 1),
-                row["source"],
-            ])
+            writer.writerow([row["topic"], row["subtopic"], row["note"], row["source"]])
 
-    search_file = run_dir / "search_index.csv"
-    with search_file.open("w", encoding="utf-8", newline="") as f:
+    run_manifest = runs_dir / "run_manifest.csv"
+    with run_manifest.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["topic", "subtopic", "final_note", "path_hint"])
         for row in sorted(rows, key=lambda r: (r["topic"], r["subtopic"], r["note"].lower())):
@@ -323,51 +324,45 @@ def write_indexes(run_dir: Path, rows: List[dict], duplicate_counts: Dict[str, i
                 row["topic"],
                 row["subtopic"],
                 row["note"],
-                f"{sanitize_name(row['topic'])}/{sanitize_name(row['subtopic'])}/{sanitize_name(row['subtopic'])}.docx",
+                f"knowledge_base/topics/{sanitize_name(row['topic'])}/{sanitize_name(row['subtopic'])}/{sanitize_name(row['subtopic'])}__{run_ts}.docx",
             ])
 
-
-def refresh_latest(output_root: Path, run_dir: Path) -> Path:
-    latest_dir = output_root / "latest"
-    if latest_dir.exists():
-        shutil.rmtree(latest_dir)
-    shutil.copytree(run_dir, latest_dir)
-    return latest_dir
+    return master_index, run_manifest
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Organize notes from DOCs/ into topic/subtopic .docx outputs.")
+    parser = argparse.ArgumentParser(description="Grow immutable note knowledge base from DOCs/ to OUTPUT/.")
     parser.add_argument("--docs-dir", type=Path, default=Path("DOCs"), help="Raw note folder (default: DOCs)")
     parser.add_argument("--output-root", type=Path, default=Path("OUTPUT"), help="Output root folder (default: OUTPUT)")
     args = parser.parse_args()
 
-    source_files = discover_input_files(args.docs_dir)
+    run_ts = timestamp()
+    knowledge_dir = args.output_root / "knowledge_base"
+    runs_dir = args.output_root / "runs" / f"run_{run_ts}"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    files = discover_input_files(args.docs_dir)
     raw_notes: List[str] = []
-    for source in source_files:
-        raw_notes.extend(load_notes_from_file(source))
+    for f in files:
+        raw_notes.extend(load_notes_from_file(f))
     if not raw_notes:
-        raise SystemExit("No note lines found in input files.")
+        raise SystemExit("No note lines found in inputs.")
 
-    unique_notes, duplicate_counts = deduplicate_and_clean(raw_notes)
-    prior_rows = load_prior_notes(args.output_root)
-    merged_rows = merge_new_with_prior(unique_notes, prior_rows)
+    cleaned_notes = deduplicate_and_clean(raw_notes)
+    existing_rows = load_existing_knowledge(knowledge_dir / "index_snapshots")
+    merged_rows = merge_knowledge(existing_rows, cleaned_notes)
 
-    run_dir = args.output_root / f"notes_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    docs = write_snapshot_docs(knowledge_dir, merged_rows, run_ts)
+    master_index, run_manifest = write_indexes(knowledge_dir, runs_dir, merged_rows, run_ts)
 
-    generated = write_outputs(run_dir, merged_rows)
-    write_indexes(run_dir, merged_rows, duplicate_counts)
-    latest_dir = refresh_latest(args.output_root, run_dir)
-
-    print(f"Source files: {len(source_files)}")
-    for source in source_files:
-        print(f" - {source}")
-    print(f"Merged notes in knowledge base: {len(merged_rows)}")
-    print(f"Output folder: {run_dir.resolve()}")
-    print(f"Latest folder: {latest_dir.resolve()}")
-    print(f"Generated documents: {len(generated)}")
-    for output in generated:
-        print(f" - {output}")
+    print(f"Run timestamp: {run_ts}")
+    print(f"Source files: {len(files)}")
+    for f in files:
+        print(f" - {f}")
+    print(f"Knowledge notes total: {len(merged_rows)}")
+    print(f"Knowledge docs generated this run: {len(docs)}")
+    print(f"Master index snapshot: {master_index.resolve()}")
+    print(f"Run manifest: {run_manifest.resolve()}")
 
 
 if __name__ == "__main__":
