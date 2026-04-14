@@ -1,53 +1,56 @@
 # Note Organizer to Word Documents
 
-This project helps you turn long-running notes into **separate Word files by topic**, ready to upload into OneNote.
+This project turns raw notes into **separate Word files by topic**, ready for OneNote upload.
 
-## What this version improves
+## What it does
 
-- Removes duplicates (including near-duplicates after normalization).
-- Lightly cleans shorthand (example: `mtg` → `meeting`) so notes read clearly.
-- Categorizes notes into topic sections using transparent keyword rules.
-- Writes one `.docx` file per section/topic.
-- Writes an `categorization_audit.csv` report so you can verify accuracy.
-
-## Categories included
-
-- Work & Career
-- Learning & Research
-- Health & Wellness
-- Finance
-- Personal & Family
-- Ideas & Brainstorming
-- Operations & Admin
-- General / Unclassified
+- Supports note input from a **single file** or a **folder**.
+- Supports `.txt`, `.md`, and `.docx` note files.
+- Removes exact/near duplicates.
+- Applies light shorthand cleanup (for readability only).
+- Categorizes notes by topic using transparent rules.
+- Exports one `.docx` file per topic.
+- Generates `categorization_audit.csv` for verification.
 
 ## Quick start
 
-No external Python packages are required.
+### Process the first note file in `DOCS/`
+
+```bash
+python organize_notes_to_docx.py --output-dir output_docs --first-only
+```
+
+### Process all files in `DOCS/`
+
+```bash
+python organize_notes_to_docx.py --output-dir output_docs
+```
+
+### Process a specific file
 
 ```bash
 python organize_notes_to_docx.py --input sample_notes.txt --output-dir output_docs
 ```
 
-## Input format
+## Input behavior
 
-- Plain text file.
-- One note per line.
-- Empty lines ignored.
-- Bullets (`-`, `*`, numbered lists) are cleaned automatically.
+- `--input` defaults to `DOCS`.
+- If input is a directory:
+  - `--first-only` processes only the first supported file (sorted by filename).
+  - without `--first-only`, all supported files are processed.
 
 ## Output
 
 In `output_docs/`, the script creates:
 
-- One `.docx` file per category/topic.
-- `categorization_audit.csv` containing:
+- one `.docx` file per category/topic
+- `categorization_audit.csv` with:
   - category
-  - note text (after light cleanup)
+  - cleaned note text
   - merged duplicate count
 
-## Accuracy and control
+## Accuracy control
 
-- The script does **light cleanup only** to avoid changing meaning.
-- Categorization is rule-based and editable in `CATEGORY_RULES`.
-- Use `categorization_audit.csv` as a final review list before importing into OneNote.
+- Cleanup is intentionally light to avoid changing note meaning.
+- Category logic is editable in `CATEGORY_RULES`.
+- Use `categorization_audit.csv` as your final review list before import.
