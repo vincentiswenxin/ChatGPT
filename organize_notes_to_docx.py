@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
-"""Organize free-form notes into category-based Word documents.
+"""Organize notes from DOCs/ into section-based Word documents.
 
-Key behaviors:
-- Accept a single file or a folder of note files
-- Support .txt, .md, and .docx note inputs
-- Deduplicate notes (exact and near-exact normalization)
-- Lightly clean shorthand so notes are easier to read
-- Categorize each note by topic
-- Export one .docx file per topic/section (OneNote-friendly)
-- Export an audit CSV so categorization remains transparent and editable
-
-Examples:
-  python organize_notes_to_docx.py --input sample_notes.txt --output-dir out_docs
-  python organize_notes_to_docx.py --input DOCS --output-dir out_docs --first-only
+Default workflow:
+- Read raw materials from DOCs/
+- Clean + deduplicate notes
+- Categorize into professional sections (management, compliance, finance, etc.)
+- Create a downloadable output folder with one Word document per section
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import re
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -36,13 +27,14 @@ class CategoryRule:
 
 
 CATEGORY_RULES: tuple[CategoryRule, ...] = (
-    CategoryRule("Work & Career", ("meeting", "client", "deadline", "project", "team", "manager", "office", "stakeholder", "quarter", "kpi", "roadmap")),
-    CategoryRule("Learning & Research", ("learn", "study", "course", "article", "tutorial", "research", "practice", "exam", "certificate", "textbook")),
-    CategoryRule("Health & Wellness", ("doctor", "workout", "exercise", "gym", "sleep", "diet", "therapy", "meditation", "health", "checkup", "clinic", "walk")),
-    CategoryRule("Finance", ("budget", "expense", "invoice", "bill", "tax", "investment", "salary", "bank", "saving", "debt")),
-    CategoryRule("Personal & Family", ("family", "friend", "birthday", "home", "kids", "parent", "partner", "trip", "vacation", "call")),
-    CategoryRule("Ideas & Brainstorming", ("idea", "brainstorm", "concept", "draft", "prototype", "vision", "could", "might", "explore")),
-    CategoryRule("Operations & Admin", ("renew", "subscription", "appointment", "form", "document", "license", "schedule", "plan", "todo")),
+    CategoryRule("People Management", ("manager", "leadership", "1:1", "one on one", "hiring", "coach", "feedback", "promotion", "performance", "team")),
+    CategoryRule("Compliance & Risk", ("compliance", "regulation", "regulatory", "sec", "finra", "kyc", "aml", "risk", "policy", "audit", "control", "breach")),
+    CategoryRule("Wealth Management", ("portfolio", "allocation", "asset mix", "advisor", "client objective", "retirement", "estate", "trust", "wealth", "tax efficiency")),
+    CategoryRule("Investments & Markets", ("equity", "fixed income", "bond", "market", "valuation", "earnings", "macro", "rate", "duration", "volatility", "hedge")),
+    CategoryRule("Client Service", ("client", "meeting", "follow up", "proposal", "onboarding", "review", "relationship", "service")),
+    CategoryRule("Finance & Planning", ("budget", "expense", "invoice", "p&l", "forecast", "revenue", "margin", "cash flow", "opex", "capex")),
+    CategoryRule("Operations & Admin", ("process", "workflow", "document", "renew", "subscription", "appointment", "schedule", "checklist", "todo")),
+    CategoryRule("Learning & Research", ("learn", "study", "course", "research", "read", "book", "training", "certification")),
 )
 
 SHORTHAND_MAP: tuple[Tuple[str, str], ...] = (
@@ -51,10 +43,14 @@ SHORTHAND_MAP: tuple[Tuple[str, str], ...] = (
     (r"\bw/o\b", "without"),
     (r"\bappt\b", "appointment"),
     (r"\bdocs\b", "documents"),
-    (r"\bmins\b", "minutes"),
 )
 
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".docx"}
+DATE_PATTERNS = (
+    r"\b(\d{4}-\d{2}-\d{2})\b",  # 2026-04-14
+    r"\b(\d{1,2}/\d{1,2}/\d{4})\b",  # 04/14/2026
+    r"\b([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})\b",  # April 14, 2026
+)
 
 DOCX_CONTENT_TYPES = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
 <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">
@@ -96,6 +92,20 @@ def dedupe_key(note: str) -> str:
     return lowered
 
 
+def parse_date(note: str) -> Optional[datetime]:
+    for pattern in DATE_PATTERNS:
+        m = re.search(pattern, note)
+        if not m:
+            continue
+        raw = m.group(1)
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                pass
+    return None
+
+
 def split_lines_to_notes(text: str) -> List[str]:
     notes: List[str] = []
     for raw in text.splitlines():
@@ -108,7 +118,6 @@ def split_lines_to_notes(text: str) -> List[str]:
 def load_notes_from_docx(path: Path) -> List[str]:
     with ZipFile(path, "r") as zf:
         xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
-
     xml = re.sub(r"</w:p>", "\n", xml)
     xml = re.sub(r"<[^>]+>", "", xml)
     return split_lines_to_notes(xml)
@@ -123,147 +132,121 @@ def load_notes_from_file(path: Path) -> List[str]:
     return []
 
 
-def discover_input_files(input_path: Path, first_only: bool) -> List[Path]:
-    if input_path.is_file():
-        return [input_path]
-    if not input_path.is_dir():
-        raise SystemExit(f"Input path not found: {input_path}")
-
-    candidates = sorted(
-        p for p in input_path.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-    )
-    if not candidates:
-        raise SystemExit(
-            f"No supported note files found in {input_path}. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
-        )
-    return candidates[:1] if first_only else candidates
+def discover_docs_files(docs_dir: Path) -> List[Path]:
+    if not docs_dir.exists() or not docs_dir.is_dir():
+        raise SystemExit(f"DOCs directory not found: {docs_dir}")
+    files = sorted(p for p in docs_dir.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS)
+    if not files:
+        raise SystemExit(f"No supported raw note files in {docs_dir}. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+    return files
 
 
 def deduplicate_and_clean(notes: List[str]) -> Tuple[List[str], Dict[str, int]]:
     seen: Dict[str, str] = {}
-    duplicate_counts: Counter[str] = Counter()
-
+    counts: Dict[str, int] = {}
     for note in notes:
         cleaned = clean_note_text(note)
         key = dedupe_key(cleaned)
         if not key:
             continue
         if key in seen:
-            duplicate_counts[seen[key]] += 1
+            canonical = seen[key]
+            counts[canonical] = counts.get(canonical, 1) + 1
         else:
             seen[key] = cleaned
-            duplicate_counts[cleaned] += 1
-
-    unique_notes = list(seen.values())
-    return unique_notes, dict(duplicate_counts)
+            counts[cleaned] = 1
+    return list(seen.values()), counts
 
 
 def categorize_note(note: str) -> str:
     lowered = note.lower()
-    scores: Dict[str, int] = {rule.name: 0 for rule in CATEGORY_RULES}
-
+    scores = {rule.name: 0 for rule in CATEGORY_RULES}
     for rule in CATEGORY_RULES:
         for kw in rule.keywords:
             if kw in lowered:
                 scores[rule.name] += 1
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "General"
 
-    best_category = max(scores, key=scores.get)
-    return best_category if scores[best_category] > 0 else "General / Unclassified"
 
+def categorize_and_sort(notes: List[str]) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    for n in notes:
+        out.setdefault(categorize_note(n), []).append(n)
 
-def categorize_notes(notes: List[str]) -> Dict[str, List[str]]:
-    categorized: Dict[str, List[str]] = {}
-    for note in notes:
-        category = categorize_note(note)
-        categorized.setdefault(category, []).append(note)
-    return categorized
+    for section, items in out.items():
+        out[section] = sorted(items, key=lambda x: (parse_date(x) is None, parse_date(x) or datetime.min, x.lower()))
+    return out
 
 
 def paragraph_xml(text: str, bold: bool = False) -> str:
-    escaped = escape(text)
-    run_props = "<w:rPr><w:b/></w:rPr>" if bold else ""
-    return f"<w:p><w:r>{run_props}<w:t xml:space=\"preserve\">{escaped}</w:t></w:r></w:p>"
+    props = "<w:rPr><w:b/></w:rPr>" if bold else ""
+    return f"<w:p><w:r>{props}<w:t xml:space=\"preserve\">{escape(text)}</w:t></w:r></w:p>"
 
 
-def build_document_xml(title: str, notes: List[str], duplicate_counts: Dict[str, int]) -> str:
-    paragraphs: List[str] = [
+def build_doc_xml(title: str, notes: List[str], dup_counts: Dict[str, int]) -> str:
+    lines = [
         paragraph_xml(title, bold=True),
-        paragraph_xml(f"Generated on: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"),
-        paragraph_xml(f"Unique notes in section: {len(notes)}"),
-        paragraph_xml(""),
+        paragraph_xml(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", False),
+        paragraph_xml(f"Items: {len(notes)}", False),
+        paragraph_xml("", False),
     ]
+    for i, note in enumerate(notes, start=1):
+        d = parse_date(note)
+        date_prefix = f"[{d.strftime('%Y-%m-%d')}] " if d else ""
+        merged = dup_counts.get(note, 1)
+        suffix = f" (merged duplicates: {merged - 1})" if merged > 1 else ""
+        lines.append(paragraph_xml(f"{i}. {date_prefix}{note}{suffix}"))
+    body = "".join(lines)
+    return f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr/></w:body></w:document>'
 
-    for idx, note in enumerate(notes, start=1):
-        count = duplicate_counts.get(note, 1)
-        suffix = f" (merged duplicates: {count - 1})" if count > 1 else ""
-        paragraphs.append(paragraph_xml(f"{idx}. {note}{suffix}"))
 
-    body = "".join(paragraphs)
-    return f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr/></w:body></w:document>'''
-
-
-def write_simple_docx(path: Path, document_xml: str) -> None:
-    with ZipFile(path, mode="w", compression=ZIP_DEFLATED) as zf:
+def write_docx(path: Path, xml: str) -> None:
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", DOCX_CONTENT_TYPES)
         zf.writestr("_rels/.rels", DOCX_RELS)
-        zf.writestr("word/document.xml", document_xml)
+        zf.writestr("word/document.xml", xml)
 
 
-def write_docx_per_category(categorized: Dict[str, List[str]], output_dir: Path, duplicate_counts: Dict[str, int]) -> List[Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def write_outputs(base_out: Path, sections: Dict[str, List[str]], dup_counts: Dict[str, int]) -> List[Path]:
     generated: List[Path] = []
-
-    for category, notes in sorted(categorized.items()):
-        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", category).strip("_")
-        out_path = output_dir / f"{safe_name}.docx"
-        write_simple_docx(out_path, build_document_xml(category, notes, duplicate_counts))
-        generated.append(out_path)
-
+    for section, notes in sorted(sections.items()):
+        folder_name = re.sub(r"[^A-Za-z0-9_-]+", "_", section).strip("_") or "General"
+        section_dir = base_out / folder_name
+        section_dir.mkdir(parents=True, exist_ok=True)
+        docx_path = section_dir / f"{folder_name}.docx"
+        write_docx(docx_path, build_doc_xml(section, notes, dup_counts))
+        generated.append(docx_path)
     return generated
 
 
-def write_audit_csv(output_dir: Path, categorized: Dict[str, List[str]], duplicate_counts: Dict[str, int]) -> Path:
-    path = output_dir / "categorization_audit.csv"
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["category", "note", "merged_count"])
-        for category, notes in sorted(categorized.items()):
-            for note in notes:
-                writer.writerow([category, note, duplicate_counts.get(note, 1)])
-    return path
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Deduplicate, clean, categorize, and export notes into Word documents by topic.")
-    parser.add_argument("--input", type=Path, default=Path("DOCS"), help="Input note file or directory (default: DOCS)")
-    parser.add_argument("--output-dir", required=True, type=Path, help="Directory where category .docx files will be written")
-    parser.add_argument("--first-only", action="store_true", help="When input is a directory, process only the first note file")
+    parser = argparse.ArgumentParser(description="Organize raw notes from DOCs/ into professional section-based Word files.")
+    parser.add_argument("--docs-dir", type=Path, default=Path("DOCs"), help="Raw materials folder (default: DOCs)")
+    parser.add_argument("--output-root", type=Path, default=Path("OUTPUT"), help="Root output folder for downloadable results")
     args = parser.parse_args()
 
-    files = discover_input_files(args.input, first_only=args.first_only)
+    source_files = discover_docs_files(args.docs_dir)
     raw_notes: List[str] = []
-    for file in files:
-        file_notes = load_notes_from_file(file)
-        if file_notes:
-            raw_notes.extend(file_notes)
-
+    for f in source_files:
+        raw_notes.extend(load_notes_from_file(f))
     if not raw_notes:
-        raise SystemExit("No notes found in selected input files.")
+        raise SystemExit("No note lines found in DOCs inputs.")
 
-    unique_notes, duplicate_counts = deduplicate_and_clean(raw_notes)
-    categorized = categorize_notes(unique_notes)
+    unique_notes, dup_counts = deduplicate_and_clean(raw_notes)
+    sections = categorize_and_sort(unique_notes)
 
-    generated = write_docx_per_category(categorized, args.output_dir, duplicate_counts)
-    audit_file = write_audit_csv(args.output_dir, categorized, duplicate_counts)
+    run_folder = args.output_root / f"notes_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    run_folder.mkdir(parents=True, exist_ok=True)
+    generated = write_outputs(run_folder, sections, dup_counts)
 
-    print(f"Processed {len(files)} file(s):")
-    for file in files:
-        print(f" - {file}")
-    print(f"Processed {len(raw_notes)} raw notes into {len(unique_notes)} unique notes across {len(generated)} Word documents.")
-    print(f"Audit CSV: {audit_file}")
-    for path in generated:
-        print(f" - {path}")
+    print(f"Source files: {len(source_files)}")
+    for f in source_files:
+        print(f" - {f}")
+    print(f"Output folder: {run_folder}")
+    print(f"Generated section documents: {len(generated)}")
+    for g in generated:
+        print(f" - {g}")
 
 
 if __name__ == "__main__":

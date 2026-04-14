@@ -1,56 +1,57 @@
-# Note Organizer to Word Documents
+# Professional Note Organizer (DOCs ➜ OUTPUT)
 
-This project turns raw notes into **separate Word files by topic**, ready for OneNote upload.
+This tool is built for your workflow:
 
-## What it does
+- You place raw materials in `DOCs/`.
+- Script organizes notes into professional sections.
+- Script creates a downloadable run folder in `OUTPUT/`.
+- Every output artifact is a **Word document (`.docx`)**, grouped by section folder.
 
-- Supports note input from a **single file** or a **folder**.
-- Supports `.txt`, `.md`, and `.docx` note files.
-- Removes exact/near duplicates.
-- Applies light shorthand cleanup (for readability only).
-- Categorizes notes by topic using transparent rules.
-- Exports one `.docx` file per topic.
-- Generates `categorization_audit.csv` for verification.
-
-## Quick start
-
-### Process the first note file in `DOCS/`
+## Run
 
 ```bash
-python organize_notes_to_docx.py --output-dir output_docs --first-only
+python organize_notes_to_docx.py
 ```
 
-### Process all files in `DOCS/`
+Defaults:
+- input folder: `DOCs/`
+- output root: `OUTPUT/`
+
+Optional:
 
 ```bash
-python organize_notes_to_docx.py --output-dir output_docs
+python organize_notes_to_docx.py --docs-dir DOCs --output-root OUTPUT
 ```
 
-### Process a specific file
+## Output structure
 
-```bash
-python organize_notes_to_docx.py --input sample_notes.txt --output-dir output_docs
-```
+For each run, the script creates:
 
-## Input behavior
+- `OUTPUT/notes_export_YYYYMMDD_HHMMSS/`
+  - one folder per section (e.g., `People_Management/`)
+  - one Word file per section (e.g., `People_Management/People_Management.docx`)
 
-- `--input` defaults to `DOCS`.
-- If input is a directory:
-  - `--first-only` processes only the first supported file (sorted by filename).
-  - without `--first-only`, all supported files are processed.
+## Sections (professional taxonomy)
 
-## Output
+- People Management
+- Compliance & Risk
+- Wealth Management
+- Investments & Markets
+- Client Service
+- Finance & Planning
+- Operations & Admin
+- Learning & Research
+- General
 
-In `output_docs/`, the script creates:
+## Logic quality rules
 
-- one `.docx` file per category/topic
-- `categorization_audit.csv` with:
-  - category
-  - cleaned note text
-  - merged duplicate count
+- Notes are deduplicated using normalized matching.
+- Cleanup is intentionally light so original meaning remains intact.
+- Dates (if present) are extracted and used for ordering.
+- Similar topics are grouped into the same section document.
 
-## Accuracy control
+## Supported raw formats in DOCs
 
-- Cleanup is intentionally light to avoid changing note meaning.
-- Category logic is editable in `CATEGORY_RULES`.
-- Use `categorization_audit.csv` as your final review list before import.
+- `.txt`
+- `.md`
+- `.docx`
