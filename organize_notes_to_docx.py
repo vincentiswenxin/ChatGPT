@@ -4,7 +4,7 @@
 Workflow:
 1) Read .txt/.md/.docx files from DOCs/
 2) Normalize + lightly clean + deduplicate notes
-3) Categorize notes into professional sections
+3) Categorize notes (rule-based or OpenAI-assisted)
 4) Write one .docx per section into a timestamped export folder
 5) Refresh OUTPUT/latest/ with the newest export
 """
@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib import error, request
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -39,6 +42,8 @@ CATEGORY_RULES: tuple[CategoryRule, ...] = (
     CategoryRule("Operations & Admin", ("process", "workflow", "document", "renew", "subscription", "appointment", "schedule", "checklist", "todo")),
     CategoryRule("Learning & Research", ("learn", "study", "course", "research", "read", "book", "training", "certification")),
 )
+
+ALLOWED_CATEGORIES = {rule.name for rule in CATEGORY_RULES} | {"General"}
 
 SHORTHAND_MAP: tuple[Tuple[str, str], ...] = (
     (r"\bmtg\b", "meeting"),
@@ -154,7 +159,7 @@ def deduplicate_and_clean(notes: Iterable[str]) -> Tuple[List[str], Dict[str, in
     return list(seen_by_key.values()), counts
 
 
-def categorize_note(note: str) -> str:
+def categorize_note_rule_based(note: str) -> str:
     lowered = note.lower()
     scores = {rule.name: 0 for rule in CATEGORY_RULES}
     for rule in CATEGORY_RULES:
@@ -165,17 +170,98 @@ def categorize_note(note: str) -> str:
     return best if scores[best] > 0 else "General"
 
 
-def categorize_and_sort(notes: Iterable[str]) -> Dict[str, List[str]]:
-    grouped: Dict[str, List[str]] = {}
-    for note in notes:
-        grouped.setdefault(categorize_note(note), []).append(note)
+def sort_notes(notes: Iterable[str]) -> List[str]:
+    return sorted(notes, key=lambda n: (parse_date(n) is None, parse_date(n) or datetime.min, n.lower()))
 
-    for section, section_notes in grouped.items():
-        grouped[section] = sorted(
-            section_notes,
-            key=lambda n: (parse_date(n) is None, parse_date(n) or datetime.min, n.lower()),
-        )
-    return grouped
+
+def extract_json_array(text: str) -> List[dict]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON array found in model response")
+    return json.loads(text[start : end + 1])
+
+
+def call_openai_chat(model: str, prompt: str, api_key: str, timeout_seconds: int = 90) -> str:
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": "You are a precise financial/compliance note editor and classifier."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    req = request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"OpenAI API error: HTTP {exc.code} {detail}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"OpenAI API connection error: {exc}") from exc
+
+    try:
+        return body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected OpenAI response format: {body}") from exc
+
+
+def ai_rewrite_and_categorize(notes: List[str], model: str, api_key: str) -> List[dict]:
+    categories = ", ".join(sorted(ALLOWED_CATEGORIES))
+    notes_json = json.dumps(notes, ensure_ascii=False)
+    prompt = (
+        "For each note, create a professional rewrite and choose one category.\n"
+        "Rules:\n"
+        "- Keep factual meaning, do not invent details.\n"
+        "- Improve clarity, grammar, and professionalism.\n"
+        "- Keep each rewrite concise and complete.\n"
+        f"- category must be exactly one of: {categories}.\n"
+        "Return only JSON array with objects of shape: "
+        "{\"original\": string, \"rewritten\": string, \"category\": string}.\n"
+        f"Input notes: {notes_json}"
+    )
+    raw = call_openai_chat(model=model, prompt=prompt, api_key=api_key)
+    items = extract_json_array(raw)
+
+    by_original: Dict[str, dict] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        original = str(item.get("original", "")).strip()
+        rewritten = str(item.get("rewritten", "")).strip()
+        category = str(item.get("category", "")).strip()
+        if not original:
+            continue
+        if category not in ALLOWED_CATEGORIES:
+            category = "General"
+        if not rewritten:
+            rewritten = original
+        by_original[original] = {"original": original, "rewritten": rewritten, "category": category}
+
+    output: List[dict] = []
+    for note in notes:
+        output.append(by_original.get(note, {"original": note, "rewritten": note, "category": categorize_note_rule_based(note)}))
+    return output
+
+
+def build_sections_from_items(items: List[dict]) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[str]] = {}
+    for item in items:
+        grouped.setdefault(item["category"], []).append(item["rewritten"])
+    return {section: sort_notes(values) for section, values in grouped.items()}
 
 
 def paragraph_xml(text: str, bold: bool = False) -> str:
@@ -223,13 +309,19 @@ def write_outputs(output_dir: Path, sections: Dict[str, List[str]], dup_counts: 
     return generated
 
 
-def write_audit_csv(path: Path, sections: Dict[str, List[str]], dup_counts: Dict[str, int]) -> None:
+def write_audit_csv(path: Path, items: List[dict], dup_counts: Dict[str, int], ai_enabled: bool) -> None:
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["section", "note", "duplicates_merged"])
-        for section, notes in sorted(sections.items()):
-            for note in notes:
-                writer.writerow([section, note, max(0, dup_counts.get(note, 1) - 1)])
+        writer.writerow(["category", "original_note", "final_note", "duplicates_merged", "ai_enhanced"])
+        for item in items:
+            final_note = item["rewritten"]
+            writer.writerow([
+                item["category"],
+                item["original"],
+                final_note,
+                max(0, dup_counts.get(item["original"], 1) - 1),
+                "yes" if ai_enabled else "no",
+            ])
 
 
 def refresh_latest(output_root: Path, run_dir: Path) -> Path:
@@ -244,6 +336,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Organize notes from DOCs/ into sectioned .docx outputs.")
     parser.add_argument("--docs-dir", type=Path, default=Path("DOCs"), help="Raw note folder (default: DOCs)")
     parser.add_argument("--output-root", type=Path, default=Path("OUTPUT"), help="Output root folder (default: OUTPUT)")
+    parser.add_argument("--use-openai", action="store_true", help="Use OpenAI model to rewrite and categorize notes.")
+    parser.add_argument("--openai-model", default="gpt-4.1-mini", help="Model name when --use-openai is enabled.")
     args = parser.parse_args()
 
     source_files = discover_input_files(args.docs_dir)
@@ -254,17 +348,32 @@ def main() -> None:
         raise SystemExit("No note lines found in input files.")
 
     unique_notes, dup_counts = deduplicate_and_clean(raw_notes)
-    sections = categorize_and_sort(unique_notes)
+
+    ai_enabled = False
+    if args.use_openai:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise SystemExit("--use-openai was set, but OPENAI_API_KEY is missing.")
+        items = ai_rewrite_and_categorize(unique_notes, args.openai_model, api_key)
+        ai_enabled = True
+    else:
+        items = [
+            {"original": note, "rewritten": note, "category": categorize_note_rule_based(note)}
+            for note in unique_notes
+        ]
+
+    sections = build_sections_from_items(items)
 
     run_dir = args.output_root / f"notes_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     generated = write_outputs(run_dir, sections, dup_counts)
-    write_audit_csv(run_dir / "categorization_audit.csv", sections, dup_counts)
+    write_audit_csv(run_dir / "categorization_audit.csv", items, dup_counts, ai_enabled)
     latest_dir = refresh_latest(args.output_root, run_dir)
 
     print(f"Source files: {len(source_files)}")
     for source in source_files:
         print(f" - {source}")
+    print(f"AI mode: {'enabled' if ai_enabled else 'disabled'}")
     print(f"Output folder: {run_dir.resolve()}")
     print(f"Latest folder: {latest_dir.resolve()}")
     print(f"Generated section documents: {len(generated)}")
